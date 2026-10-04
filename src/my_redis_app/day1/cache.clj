@@ -75,3 +75,144 @@
           (let [p (fetch-profile-cached pool uid)]
             {:user_id uid :name (:name p) :level (:level p)}))
         user-ids))
+
+(defn render-ranking-direct-bulk
+  "キャッシュなし。ただし DB へのクエリは IN でまとめる。"
+  [user-ids]
+  (swap! db-hits inc)
+  (let [ph   (clojure.string/join "," (repeat (count user-ids) "?"))
+        rows (apply db/q
+                    (str "SELECT user_id, name, level FROM users WHERE user_id IN (" ph ")")
+                    user-ids)
+        by-id (into {} (map (juxt :user_id identity)) rows)]
+    (mapv (fn [uid]
+            (let [p (by-id uid)]
+              {:user_id uid :name (:name p) :level (:level p)}))
+          user-ids)))
+
+(defn fetch-profiles-cached
+  "複数ユーザーのプロフィールを取る。
+   キャッシュは MGET で 1 往復、ミスした分だけ DB から IN で取る。"
+  [pool user-ids]
+  (let [ks     (mapv profile-key user-ids)
+        cached (apply r/cmd pool "MGET" ks)
+        pairs  (map vector user-ids cached)
+        hits   (into {} (keep (fn [[uid s]]
+                                (when s [uid (decode-profile uid s)]))) pairs)
+        misses (mapv first (remove (fn [[_ s]] s) pairs))]
+    (swap! cache-hits + (count hits))
+    (swap! cache-miss + (count misses))
+    (let [fetched (when (seq misses)
+                    (swap! db-hits + (count misses))
+                    (let [ph (str/join "," (repeat (count misses) "?"))
+                          rows (apply db/q
+                                      (str "SELECT user_id, name, level FROM users WHERE user_id IN (" ph ")")
+                                      misses)]
+                      (into {} (map (juxt :user_id identity)) rows)))]
+      ;; ミスした分をキャッシュに入れる
+      (doseq [[uid p] fetched]
+        (r/cmd pool "SET" (profile-key uid) (encode-profile p) "EX" profile-ttl))
+      ;; 元の順序で返す
+      (mapv (fn [uid] (or (hits uid) (fetched uid))) user-ids))))
+
+(defn render-ranking-mget
+  [pool user-ids]
+  (mapv (fn [p] {:user_id (:user_id p) :name (:name p) :level (:level p)})
+        (fetch-profiles-cached pool user-ids)))
+
+;; ---------- ランキングのキャッシュ ----------
+
+(def ^:const ranking-ttl 5)
+(def ^:const ranking-key "ranking:top20")
+
+(defn compute-ranking
+  "ランキングを DB で計算する。10 万行の集計 + ソート。重い。"
+  [n]
+  (swap! db-hits inc)
+  (db/q "SELECT p.user_id, u.name, u.level, max(p.score) AS best
+         FROM plays p JOIN users u USING (user_id)
+         GROUP BY p.user_id, u.name, u.level
+         ORDER BY best DESC LIMIT ?" n))
+
+(defn- encode-ranking
+  "ランキングを 1 つの文字列にする。行を \\u0002、列を \\u0001 で区切る。"
+  [rows]
+  (clojure.string/join "\u0002"
+                       (map (fn [{:keys [user_id name level best]}]
+                              (clojure.string/join "\u0001" [user_id name level best]))
+                            rows)))
+
+(defn- decode-ranking
+  [s]
+  (when (seq s)
+    (mapv (fn [line]
+            (let [[uid nm lv best] (clojure.string/split line #"\u0001")]
+              {:user_id uid :name nm
+               :level (Long/parseLong lv) :best (Long/parseLong best)}))
+          (clojure.string/split s #"\u0002"))))
+
+(defn ranking-direct
+  "キャッシュなし。毎回 DB で計算する。"
+  [n]
+  (compute-ranking n))
+
+(defn ranking-cached
+  "cache-aside。無ければ計算してキャッシュに入れる。"
+  [pool n]
+  (if-let [cached (r/cmd pool "GET" ranking-key)]
+    (do (swap! cache-hits inc)
+        (decode-ranking cached))
+    (do (swap! cache-miss inc)
+        (let [rows (compute-ranking n)]
+          (r/cmd pool "SET" ranking-key (encode-ranking rows) "EX" ranking-ttl)
+          rows))))
+
+(defn watch-expiry
+  "TTL が切れる瞬間に負荷が集中することを観察する。"
+  [pool seconds]
+  (r/cmd pool "FLUSHDB")
+  (reset-counters!)
+  (let [stop (atom false)
+        log  (atom [])]
+    ;; 20 スレッドが継続的にアクセス
+    (let [workers (doall
+                   (for [_ (range 20)]
+                     (future
+                       (while (not @stop)
+                         (ranking-cached pool 20)))))]
+      ;; 1 秒ごとに DB クエリ数を記録
+      (dotimes [i seconds]
+        (Thread/sleep 1000)
+        (swap! log conj {:sec i :db @db-hits}))
+      (reset! stop true)
+      (run! deref workers))
+    ;; 秒ごとの増分を出す
+    (let [counts (mapv :db @log)]
+      (println "秒ごとの DB クエリ数:")
+      (doseq [[i [a b]] (map-indexed vector (partition 2 1 (cons 0 counts)))]
+        (println (format "  %2d 秒: %3d 件" i (- b a)))))))
+
+(comment
+  (require '[my-redis-app.day1.cache :as d1] '[my-redis-app.redis :as r]
+           '[my-redis-app.bench :as bench] :reload)
+
+  (def mine (r/pool 6380))
+  (def top20 (d1/top-user-ids 20))
+
+  (r/cmd mine "FLUSHDB")
+  (d1/ranking-cached mine 20)
+  (bench/report "ランキング（DB 直撃）" (bench/timed #(d1/ranking-direct 20) 30))
+  (bench/report "ランキング（キャッシュ）" (bench/timed #(d1/ranking-cached mine 20) 500))
+
+  ;; 同時アクセス
+  (doseq [[label f] [["DB 直撃"   #(d1/ranking-direct 20)]
+                     ["キャッシュ" #(d1/ranking-cached mine 20)]]]
+    (r/cmd mine "FLUSHDB")
+    (d1/reset-counters!)
+    (let [ms (bench/concurrently f 20 10)]
+      (println (format "%-12s %7.0f ms  %6.1f req/秒  %s"
+                       label ms (/ 200000.0 ms) (d1/stats)))))
+
+  ;; day1_cache.clj の ranking-ttl を 5 に変えて reload
+  (d1/watch-expiry mine 20)
+  )

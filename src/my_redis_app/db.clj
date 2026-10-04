@@ -3,17 +3,21 @@
   (:require [clojure.data.csv :as csv]
             [clojure.java.io :as io]
             [next.jdbc :as jdbc]
-            [next.jdbc.result-set :as rs]))
+            [next.jdbc.connection :as connection]
+            [next.jdbc.result-set :as rs])
+  (:import [com.zaxxer.hikari HikariDataSource]))
 
 (def db-spec
   {:dbtype "postgresql"
    :host   "localhost"
    :port   5437
    :dbname "game"
-   :user   "postgres"
+   :username "postgres"
    :password "postgres"})
 
-(def ds (jdbc/get-datasource db-spec))
+(defonce ^HikariDataSource ds
+  (connection/->pool HikariDataSource
+                     (assoc db-spec :maximumPoolSize 10)))
 
 (def opts {:builder-fn rs/as-unqualified-lower-maps})
 

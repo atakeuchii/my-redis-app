@@ -192,6 +192,133 @@
       (doseq [[i [a b]] (map-indexed vector (partition 2 1 (cons 0 counts)))]
         (println (format "  %2d 秒: %3d 件" i (- b a)))))))
 
+;; ---------- (A) 再計算ロック ----------
+
+(def ^:const lock-ttl 10)
+
+(defn ranking-locked
+  "ミス時、ロックを取れた 1 人だけが計算する。
+   取れなかった者は少し待ってキャッシュを見直す。"
+  [pool n]
+  (let [lock-key (str ranking-key ":lock")]
+    (loop [attempt 0]
+      (if-let [cached (r/cmd pool "GET" ranking-key)]
+        (do (swap! cache-hits inc) (decode-ranking cached))
+        (do
+          (swap! cache-miss inc)
+          (if (= "OK" (r/cmd pool "SET" lock-key "1" "NX" "EX" lock-ttl))
+            ;; ロックを取れた: 自分が計算する
+            (try
+              (let [rows (compute-ranking n)]
+                (r/cmd pool "SET" ranking-key (encode-ranking rows) "EX" ranking-ttl)
+                rows)
+              (finally (r/cmd pool "DEL" lock-key)))
+            ;; 取れなかった: 待ってから見直す
+            (if (< attempt 50)
+              (do (Thread/sleep 10) (recur (inc attempt)))
+              ;; 待ちきれなければ自分で計算する（フォールバック）
+              (compute-ranking n))))))))
+
+;; ---------- (B) TTL のばらつき ----------
+
+(defn- jittered-ttl
+  "base の ±jitter% の範囲でばらつかせる。"
+  [base jitter-pct]
+  (let [j (* base (/ jitter-pct 100.0))]
+    (int (+ base (- (rand (* 2 j)) j)))))
+
+(defn ranking-cached-jitter
+  [pool n]
+  (if-let [cached (r/cmd pool "GET" ranking-key)]
+    (do (swap! cache-hits inc) (decode-ranking cached))
+    (do (swap! cache-miss inc)
+        (let [rows (compute-ranking n)]
+          (r/cmd pool "SET" ranking-key (encode-ranking rows)
+                 "EX" (jittered-ttl ranking-ttl 30))
+          rows))))
+
+;; ---------- (C) 論理期限 ----------
+
+(defn- encode-with-expiry
+  [rows logical-expire-at]
+  (str logical-expire-at "\u0003" (encode-ranking rows)))
+
+(defn- decode-with-expiry
+  [s]
+  (when (seq s)
+    (let [[exp body] (clojure.string/split s #"\u0003" 2)]
+      {:expire-at (Long/parseLong exp) :rows (decode-ranking body)})))
+
+(defn ranking-early-refresh
+  "物理 TTL より短い論理期限を持たせ、近づくほど高い確率で再計算する。
+   期限切れを待たずに更新するので、全員がミスする瞬間が来ない。"
+  [pool n]
+  (let [now (System/currentTimeMillis)]
+    (if-let [cached (r/cmd pool "GET" ranking-key)]
+      (let [{:keys [expire-at rows]} (decode-with-expiry cached)
+            remain (- expire-at now)
+            ;; 残り時間が短いほど再計算の確率が上がる
+            refresh? (or (neg? remain)
+                         (< (rand) (- 1.0 (/ remain (* ranking-ttl 1000.0)))))]
+        (if refresh?
+          (do (swap! cache-miss inc)
+              (let [rows (compute-ranking n)]
+                (r/cmd pool "SET" ranking-key
+                       (encode-with-expiry rows (+ now (* ranking-ttl 1000)))
+                       "EX" (* 2 ranking-ttl))      ; 物理 TTL は長めに
+                rows))
+          (do (swap! cache-hits inc) rows)))
+      (do (swap! cache-miss inc)
+          (let [rows (compute-ranking n)]
+            (r/cmd pool "SET" ranking-key
+                   (encode-with-expiry rows (+ now (* ranking-ttl 1000)))
+                   "EX" (* 2 ranking-ttl))
+            rows)))))
+
+(defn ranking-best
+  "早期再計算 + ロック。再計算のタイミングを分散し、かつ 1 人に絞る。"
+  [pool n]
+  (let [now      (System/currentTimeMillis)
+        lock-key (str ranking-key ":lock")]
+    (if-let [cached (r/cmd pool "GET" ranking-key)]
+      (let [{:keys [expire-at rows]} (decode-with-expiry cached)
+            remain   (- expire-at now)
+            refresh? (or (neg? remain)
+                         (< (rand) (- 1.0 (/ remain (* ranking-ttl 1000.0)))))]
+        (if (and refresh?
+                 (= "OK" (r/cmd pool "SET" lock-key "1" "NX" "EX" lock-ttl)))
+          ;; 再計算すると判断し、かつロックを取れた人だけが計算する
+          (try
+            (swap! cache-miss inc)
+            (let [rows (compute-ranking n)]
+              (r/cmd pool "SET" ranking-key
+                     (encode-with-expiry rows (+ now (* ranking-ttl 1000)))
+                     "EX" (* 2 ranking-ttl))
+              rows)
+            (finally (r/cmd pool "DEL" lock-key)))
+          ;; それ以外は古い値をそのまま返す（待たない）
+          (do (swap! cache-hits inc) rows)))
+      ;; キャッシュが無い（初回のみ）
+      (do (swap! cache-miss inc)
+          (let [rows (compute-ranking n)]
+            (r/cmd pool "SET" ranking-key
+                   (encode-with-expiry rows (+ now (* ranking-ttl 1000)))
+                   "EX" (* 2 ranking-ttl))
+            rows)))))
+
+;; ---------- 更新 ----------
+
+(defn update-name-db!
+  "DB のユーザー名を更新する。"
+  [user-id new-name]
+  (db/q "UPDATE users SET name = ? WHERE user_id = ?" new-name user-id))
+
+(defn update-name-invalidate!
+  "(A) DB を更新してキャッシュを消す。"
+  [pool user-id new-name]
+  (update-name-db! user-id new-name)
+  (r/cmd pool "DEL" (profile-key user-id)))
+
 (comment
   (require '[my-redis-app.day1.cache :as d1] '[my-redis-app.redis :as r]
            '[my-redis-app.bench :as bench] :reload)
@@ -215,4 +342,33 @@
 
   ;; day1_cache.clj の ranking-ttl を 5 に変えて reload
   (d1/watch-expiry mine 20)
-  )
+
+  ;; さらなる改善
+  (defn compare-strategies []
+    (doseq [[label f] [["素朴"       #(d1/ranking-cached mine 20)]
+                       ["ロック"     #(d1/ranking-locked mine 20)]
+                       ["早期再計算" #(d1/ranking-early-refresh mine 20)]]]
+      (r/cmd mine "FLUSHDB")
+      (d1/reset-counters!)
+      (let [ms (bench/concurrently f 20 10)]
+        (println (format "%-12s %6.0f ms  %6.1f req/秒  DB=%3d hit=%4d miss=%3d"
+                         label ms (/ 200000.0 ms)
+                         @d1/db-hits @d1/cache-hits @d1/cache-miss)))))
+  (compare-strategies)
+
+  (defn watch-strategy [label f seconds]
+    (r/cmd mine "FLUSHDB")
+    (d1/reset-counters!)
+    (let [stop (atom false)
+          log  (atom [])]
+      (let [workers (doall (for [_ (range 20)]
+                             (future (while (not @stop) (f)))))]
+        (dotimes [i seconds]
+          (Thread/sleep 1000)
+          (swap! log conj @d1/db-hits))
+        (reset! stop true)
+        (run! deref workers))
+      (println label (vec (map - @log (cons 0 @log))))))
+
+  (watch-strategy "素朴  " #(d1/ranking-cached mine 20) 15)
+  (watch-strategy "ロック" #(d1/ranking-locked mine 20) 15))
